@@ -1,5 +1,7 @@
 {
   "seenSessionIds": [],
   "lastRunISO": "2026-08-21T15:52:49.830Z",
-  "lastCanaryOk": true
+  "lastCanaryOk": true,
+  "knownFormats": [],
+  "targetSeenInFilms": false
 }
