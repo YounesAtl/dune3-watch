@@ -1,0 +1,126 @@
+#
+# Dune 3 IMAX 70mm watcher for Kinepolis Brussel. Push notifications only.
+#
+# ONE secret required: NTFY_TOPIC
+#
+# Actions-minutes budget (private repo = 2000 free min/month, jobs billed
+# rounded UP to a whole minute):
+#   poll      every 30 min  → ~1440 runs/month → ~1440 min
+#   selftest  weekly        → ~4 runs/month    → ~4 min
+#   ------------------------------------------------------ ~1444 / 2000
+# If you ever add a second scheduled job, re-do this sum first. Overrunning the
+# cap silently stops the watcher, which is the one failure you can't afford.
+
+name: Dune 3 IMAX 70mm watch
+
+on:
+  workflow_dispatch:              # manual + your external trigger
+  repository_dispatch:
+    types: [poll]
+  schedule:
+    # Every 30 minutes, at :07 and :37. Deliberately off the :00/:30 marks —
+    # those are the most contended minutes on GitHub's scheduler and the most
+    # likely to be delayed or dropped.
+    - cron: '7,37 * * * *'
+    # Weekly proof-of-life, Mondays 09:13 UTC. Separate cron so the selftest job
+    # can tell itself apart from a routine poll via github.event.schedule.
+    - cron: '13 9 * * 1'
+
+permissions:
+  contents: write                 # to commit seen.json / heartbeat back
+
+concurrency:
+  group: kinepolis-watch
+  cancel-in-progress: false       # never kill a run mid-push
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # The one thing that couldn't be tested from a laptop: does a GitHub
+      # runner's datacenter IP get the same open access to the Kinepolis API
+      # that a home connection does? Look for "HTTP/2 200" on the first run.
+      - name: Check API reachability from runner
+        run: |
+          curl -sSI --max-time 60 \
+            https://kinepolisweb-programmation.kinepolis.com/api/Programmation/BE/NL/WWW \
+            | head -5
+
+      - name: Poll feed
+        id: poll
+        run: node kinepolis-watch.mjs
+        env:
+          STATE_FILE: ./seen.json
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+
+      - name: Persist seen list
+        if: always()
+        run: |
+          if [[ -n "$(git status --porcelain seen.json)" ]]; then
+            git config user.name  "kinepolis-watch"
+            git config user.email "actions@github.com"
+            git add seen.json
+            git commit -m "state: update seen sessions [skip ci]"
+            git pull --rebase --autostash origin ${{ github.ref_name }} || true
+            git push
+          else
+            echo "no state change"
+          fi
+
+      # Dead-man's switch. Covers what the script itself can't report: feed
+      # unreachable, JSON shape changed, runner IP blocked, push rejected.
+      - name: Push on failure
+        if: failure()
+        run: |
+          curl -sS \
+            -H "Title: Kinepolis 70mm watcher FAILED" \
+            -H "Priority: high" \
+            -H "Tags: warning" \
+            -d "Poll job errored. See ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "https://ntfy.sh/${{ secrets.NTFY_TOPIC }}" || true
+
+  # Runs ONLY on the weekly cron — not on every poll. That `github.event.schedule`
+  # comparison is the whole point; gating on `event_name == 'schedule'` instead
+  # would fire this every 30 minutes and double the minutes bill.
+  selftest:
+    if: github.event.schedule == '13 9 * * 1'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Prove the pipeline still finds real 70mm sessions
+        run: node kinepolis-watch.mjs --selftest
+
+      # Keepalive. GitHub disables scheduled workflows after 60 days of
+      # repository inactivity, and seen.json won't change for months while we
+      # wait for December — so this weekly commit is what keeps the schedule
+      # alive. Without it the watcher would quietly switch itself off in October.
+      - name: Heartbeat
+        if: always()
+        run: |
+          date -u +"last selftest: %Y-%m-%dT%H:%M:%SZ" > heartbeat.txt
+          git config user.name  "kinepolis-watch"
+          git config user.email "actions@github.com"
+          git add heartbeat.txt
+          git commit -m "chore: weekly heartbeat [skip ci]" || exit 0
+          git pull --rebase --autostash origin ${{ github.ref_name }} || true
+          git push
+
+      - name: Push on selftest failure
+        if: failure()
+        run: |
+          curl -sS \
+            -H "Title: Kinepolis watcher selftest FAILED" \
+            -H "Priority: high" \
+            -H "Tags: warning" \
+            -d "The pipeline can no longer find 70mm sessions that should exist. See ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "https://ntfy.sh/${{ secrets.NTFY_TOPIC }}" || true
