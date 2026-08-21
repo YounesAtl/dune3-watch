@@ -1,0 +1,94 @@
+# .github/workflows/watch-70mm.yml
+#
+# Dune 3 IMAX 70mm watcher for Kinepolis Brussel. Push notifications only.
+#
+# ONE secret required:  NTFY_TOPIC
+#
+# Alert priorities (set in kinepolis-watch.mjs):
+#   urgent  → new 70mm session at Brussels. Bypasses Do Not Disturb.
+#   default → watcher looks broken.
+#   low     → informational, arrives silently.
+
+name: Dune 3 IMAX 70mm watch
+
+on:
+  workflow_dispatch:          # your external trigger hits this
+  repository_dispatch:
+    types: [poll]
+  schedule:
+    # Off the :00/:30 marks on purpose — those are the most contended minutes on
+    # GitHub's scheduler and the most likely to be silently dropped.
+    - cron: '7,37 * * * *'
+
+permissions:
+  contents: write             # to commit seen.json back
+
+concurrency:
+  group: kinepolis-watch
+  cancel-in-progress: false   # never kill a run mid-push
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Answers the one thing that couldn't be tested from your laptop: does a
+      # GitHub runner's datacenter IP get the same open access to the API that
+      # your home connection does? Look for "HTTP/2 200" here on the first run.
+      - name: Check API reachability from runner
+        run: |
+          curl -sSI --max-time 60 \
+            https://kinepolisweb-programmation.kinepolis.com/api/Programmation/BE/NL/WWW \
+            | head -5
+
+      - name: Poll feed
+        id: poll
+        run: node kinepolis-watch.mjs
+        env:
+          STATE_FILE: ./seen.json
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+
+      - name: Persist seen list
+        if: always()
+        run: |
+          if [[ -n "$(git status --porcelain seen.json)" ]]; then
+            git config user.name  "kinepolis-watch"
+            git config user.email "actions@github.com"
+            git add seen.json
+            git commit -m "state: update seen sessions [skip ci]"
+            # A concurrent run may have pushed already; rebase rather than fail.
+            git pull --rebase --autostash origin ${{ github.ref_name }} || true
+            git push
+          else
+            echo "no state change"
+          fi
+
+      # Dead-man's switch. Covers the cases the script itself can't report:
+      # feed unreachable, JSON shape changed, runner blocked, push rejected.
+      # Without this a silent death has no channel at all.
+      - name: Push on failure
+        if: failure()
+        run: |
+          curl -sS \
+            -H "Title: Kinepolis 70mm watcher FAILED" \
+            -H "Priority: high" \
+            -H "Tags: warning" \
+            -d "The poll job errored. Check ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "https://ntfy.sh/${{ secrets.NTFY_TOPIC }}" || true
+
+  # Weekly proof-of-life against real data. A red X here in October is how you
+  # find out something drifted, instead of discovering it in December.
+  selftest:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: node kinepolis-watch.mjs --selftest
