@@ -16,6 +16,11 @@ name: Dune 3 IMAX 70mm watch
 
 on:
   workflow_dispatch:              # manual + your external trigger
+    inputs:
+      test_push:
+        description: 'Send a test push notification (proves the NTFY_TOPIC secret is correct)'
+        type: boolean
+        default: false
   repository_dispatch:
     types: [poll]
   schedule:
@@ -70,6 +75,16 @@ jobs:
             exit 1
           fi
           echo "NTFY_TOPIC is set (${#NTFY_TOPIC} chars)"
+
+      # Tick "test_push" when running manually to prove the secret in GitHub is
+      # the RIGHT topic, not merely present. The verify step above only checks it
+      # is non-empty — a typo or a trailing space would pass that and then fail
+      # silently in December.
+      - name: Send test push
+        if: inputs.test_push
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: node kinepolis-watch.mjs --testpush
 
       # The dispatch SHA can be older than the branch tip, which would make the
       # script read a stale seen.json and re-alert things already reported.
