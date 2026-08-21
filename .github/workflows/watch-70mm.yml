@@ -57,6 +57,29 @@ jobs:
           echo "GET returned HTTP $code"
           [[ "$code" == "200" ]] || echo "::warning::expected 200, got $code — the poll step below is the real test"
 
+      # Fail loudly and immediately if the topic is missing. Without this the
+      # secret's absence stays invisible until the one run that actually has
+      # something to tell you — and then the alert silently goes nowhere.
+      - name: Verify NTFY_TOPIC is configured
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          if [[ -z "$NTFY_TOPIC" ]]; then
+            echo "::error::NTFY_TOPIC secret is empty or missing. Add it under"
+            echo "::error::Settings > Secrets and variables > Actions. No push can be sent without it."
+            exit 1
+          fi
+          echo "NTFY_TOPIC is set (${#NTFY_TOPIC} chars)"
+
+      # The dispatch SHA can be older than the branch tip, which would make the
+      # script read a stale seen.json and re-alert things already reported.
+      # Snap to the current tip before polling.
+      - name: Sync to branch tip
+        run: |
+          git fetch --quiet origin "${{ github.ref_name }}"
+          git reset --hard --quiet "origin/${{ github.ref_name }}"
+          echo "at $(git rev-parse --short HEAD)"
+
       - name: Poll feed
         id: poll
         run: node kinepolis-watch.mjs
@@ -64,31 +87,62 @@ jobs:
           STATE_FILE: ./seen.json
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
 
+      # NEVER rebase generated state. seen.json is a growing set, so the correct
+      # conflict resolution is always "union", which merge-state.mjs does. The
+      # loop re-reads the branch tip on each attempt, so a racing run can't
+      # clobber anything — and a persistent failure warns instead of failing the
+      # job, because a lost state write only costs a duplicate notification,
+      # whereas a red X every 30 minutes is noise that gets ignored.
       - name: Persist seen list
         if: always()
         run: |
-          if [[ -n "$(git status --porcelain seen.json)" ]]; then
-            git config user.name  "kinepolis-watch"
-            git config user.email "actions@github.com"
+          BRANCH="${{ github.ref_name }}"
+          git config user.name  "kinepolis-watch"
+          git config user.email "actions@github.com"
+
+          for attempt in 1 2 3; do
+            cp seen.json /tmp/ours.json
+            git fetch --quiet origin "$BRANCH"
+            git reset --hard --quiet "origin/$BRANCH"
+            node merge-state.mjs /tmp/ours.json seen.json
+
+            if git diff --quiet -- seen.json; then
+              echo "no state change"
+              exit 0
+            fi
+
             git add seen.json
-            git commit -m "state: update seen sessions [skip ci]"
-            git pull --rebase --autostash origin ${{ github.ref_name }} || true
-            git push
-          else
-            echo "no state change"
-          fi
+            git commit -q -m "state: update seen sessions [skip ci]"
+            if git push --quiet origin "HEAD:$BRANCH"; then
+              echo "state pushed on attempt $attempt"
+              exit 0
+            fi
+            echo "push race on attempt $attempt, retrying"
+          done
+
+          echo "::warning::could not persist seen.json after 3 attempts — worst case is a duplicate notification next run"
 
       # Dead-man's switch. Covers what the script itself can't report: feed
       # unreachable, JSON shape changed, runner IP blocked, push rejected.
       - name: Push on failure
         if: failure()
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: |
+          # Guard on the topic: with an empty one the URL collapses to
+          # https://ntfy.sh/ , which is ntfy's JSON API and answers
+          # 400 "request body must be valid JSON" — a confusing error that hides
+          # the real problem (the secret is missing).
+          if [[ -z "$NTFY_TOPIC" ]]; then
+            echo "::error::cannot send failure push — NTFY_TOPIC is not set"
+            exit 0
+          fi
           curl -sS \
             -H "Title: Kinepolis 70mm watcher FAILED" \
             -H "Priority: high" \
             -H "Tags: warning" \
             -d "Poll job errored. See ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            "https://ntfy.sh/${{ secrets.NTFY_TOPIC }}" || true
+            "https://ntfy.sh/$NTFY_TOPIC" || true
 
   # Runs ONLY on the weekly cron — not on every poll. That `github.event.schedule`
   # comparison is the whole point; gating on `event_name == 'schedule'` instead
@@ -112,13 +166,23 @@ jobs:
       - name: Heartbeat
         if: always()
         run: |
-          date -u +"last selftest: %Y-%m-%dT%H:%M:%SZ" > heartbeat.txt
+          BRANCH="${{ github.ref_name }}"
           git config user.name  "kinepolis-watch"
           git config user.email "actions@github.com"
-          git add heartbeat.txt
-          git commit -m "chore: weekly heartbeat [skip ci]" || exit 0
-          git pull --rebase --autostash origin ${{ github.ref_name }} || true
-          git push
+          # Same rule as the state push: snap to the tip, then write. Never
+          # rebase — a conflict here would fail the job for no useful reason.
+          for attempt in 1 2 3; do
+            git fetch --quiet origin "$BRANCH"
+            git reset --hard --quiet "origin/$BRANCH"
+            date -u +"last selftest: %Y-%m-%dT%H:%M:%SZ" > heartbeat.txt
+            git add heartbeat.txt
+            git commit -q -m "chore: weekly heartbeat [skip ci]" || exit 0
+            if git push --quiet origin "HEAD:$BRANCH"; then
+              echo "heartbeat pushed on attempt $attempt"
+              exit 0
+            fi
+          done
+          echo "::warning::heartbeat push failed — check the 60-day schedule-disable rule"
 
       - name: Push on selftest failure
         if: failure()
