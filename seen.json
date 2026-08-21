@@ -1,5 +1,17 @@
 {
   "seenSessionIds": [],
-  "lastRunISO": "2026-08-21T15:52:49.830Z",
-  "lastCanaryOk": true
+  "lastRunISO": "2026-08-21T16:39:26.657Z",
+  "lastCanaryOk": true,
+  "knownFormats": [
+    "2D",
+    "4DX 2D",
+    "4DX 3D",
+    "IMAX 2D",
+    "IMAX 2D 70MM",
+    "Laser Ultra 2D",
+    "Live Stream",
+    "ScreenX 2D",
+    "ScreenX 3D"
+  ],
+  "targetSeenInFilms": false
 }
