@@ -1,19 +1,23 @@
-# .github/workflows/watch-70mm.yml
+ .github/workflows/watch-70mm.yml
 #
 # Dune 3 IMAX 70mm watcher for Kinepolis Brussel. Push notifications only.
 #
 # ONE secret required: NTFY_TOPIC
 #
-# Actions-minutes budget (private repo = 2000 free min/month, jobs billed
-# rounded UP to a whole minute):
-#   poll      every 30 min  → ~1440 runs/month → ~1440 min
-#   selftest  weekly        → ~4 runs/month    → ~4 min
-#   ------------------------------------------------------ ~1444 / 2000
-# If you ever add a second scheduled job, re-do this sum first. Overrunning the
-# cap silently stops the watcher, which is the one failure you can't afford.
-
+# COST: this configuration assumes a PUBLIC repository, where standard
+# GitHub-hosted runner minutes are free and unmetered.
+#
+#   poll      every 15 min, 24/7 → ~2900 runs/month
+#   selftest  weekly            → ~4 runs/month
+#
+# On a public repo: free. On a private repo that same usage bills ~2900 minutes
+# against a 2000-minute allowance and the watcher would stop mid-month. If this
+# repo is ever made private again, reduce the cron BEFORE flipping it:
+#   '7,37 6-22 * * *'  ≈ 1038 min/month   (every 30 min, waking hours)
+#   '7 6-22 * * *'     ≈  521 min/month   (hourly, waking hours)
+ 
 name: Dune 3 IMAX 70mm watch
-
+ 
 on:
   workflow_dispatch:              # manual + your external trigger
     inputs:
@@ -22,47 +26,44 @@ on:
         type: boolean
         default: false
   repository_dispatch:
+    types: [poll]
   schedule:
-    # Hourly at :07 during waking hours only — nothing between midnight and 07:00.
+    # Every 15 minutes, around the clock. No DST handling needed: the schedule is
+    # uniform across all hours, so it means the same thing in CET and CEST.
     #
-    # IMPORTANT: cron here is UTC and has no idea about DST, while Brussels moves
-    # between UTC+1 (CET, winter) and UTC+2 (CEST, summer). Hours 6-22 UTC means:
+    # Minutes are :07 :22 :37 :52 rather than :00 :15 :30 :45 on purpose — the
+    # quarter-hour marks are the most contended on GitHub's scheduler and the
+    # likeliest to be delayed or dropped.
     #
-    #   December (CET, UTC+1)  → 07:07 .. 23:07 local   ← exactly what you asked
-    #   Summer   (CEST, UTC+2) → 08:07 .. 00:07 local   ← one run just after midnight
+    # Worst-case latency on an onsale is now ~15 min plus GitHub's own lag.
     #
-    # Dune 3 is a December release, so this is tuned for CET. If you want zero
-    # post-midnight runs year-round instead, use '7 6-21 * * *' — that costs you
-    # the 23:00 hour in winter but never fires at night in either season.
-    #
-    # :07 rather than :00 on purpose — :00 is the most contended minute on
-    # GitHub's scheduler and the likeliest to be delayed or dropped.
-    #
-    # Latency note: hourly means up to ~60 min (plus GitHub's own lag) before an
-    # onsale is noticed. Fine for the waiting months. From early November,
-    # consider '7,37 6-22 * * *' for the run-up — the budget below has room.
-    - cron: '7 6-22 * * *'
+    # !! REQUIRES A PUBLIC REPO !!  On a public repo, standard-runner minutes are
+    # free and unmetered. On a PRIVATE repo this cron costs ~2900 min/month
+    # against a 2000-minute allowance — it would overrun and the watcher would
+    # stop. If you ever flip this repo back to private, drop to
+    # '7,37 6-22 * * *' (~1038 min) or '7 6-22 * * *' (~521 min) first.
+    - cron: '7,22,37,52 * * * *'
     # Weekly proof-of-life, Mondays 09:13 UTC. Separate cron so the selftest job
     # can tell itself apart from a routine poll via github.event.schedule.
     - cron: '13 9 * * 1'
-
+ 
 permissions:
   contents: write                 # to commit seen.json / heartbeat back
-
+ 
 concurrency:
   group: kinepolis-watch
   cancel-in-progress: false       # never kill a run mid-push
-
+ 
 jobs:
   poll:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
+ 
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-
+ 
       # Reachability check. It must be a GET with a real User-Agent: the WAF
       # answers 403 to a HEAD request (curl -I) and to curl's default UA, which
       # looks alarming but says nothing about whether the actual poll works.
@@ -75,7 +76,7 @@ jobs:
             https://kinepolisweb-programmation.kinepolis.com/api/Programmation/BE/NL/WWW)
           echo "GET returned HTTP $code"
           [[ "$code" == "200" ]] || echo "::warning::expected 200, got $code — the poll step below is the real test"
-
+ 
       # Fail loudly and immediately if the topic is missing. Without this the
       # secret's absence stays invisible until the one run that actually has
       # something to tell you — and then the alert silently goes nowhere.
@@ -89,7 +90,7 @@ jobs:
             exit 1
           fi
           echo "NTFY_TOPIC is set (${#NTFY_TOPIC} chars)"
-
+ 
       # Tick "test_push" when running manually to prove the secret in GitHub is
       # the RIGHT topic, not merely present. The verify step above only checks it
       # is non-empty — a typo or a trailing space would pass that and then fail
@@ -99,7 +100,7 @@ jobs:
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: node kinepolis-watch.mjs --testpush
-
+ 
       # The dispatch SHA can be older than the branch tip, which would make the
       # script read a stale seen.json and re-alert things already reported.
       # Snap to the current tip before polling.
@@ -108,14 +109,14 @@ jobs:
           git fetch --quiet origin "${{ github.ref_name }}"
           git reset --hard --quiet "origin/${{ github.ref_name }}"
           echo "at $(git rev-parse --short HEAD)"
-
+ 
       - name: Poll feed
         id: poll
         run: node kinepolis-watch.mjs
         env:
           STATE_FILE: ./seen.json
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-
+ 
       # NEVER rebase generated state. seen.json is a growing set, so the correct
       # conflict resolution is always "union", which merge-state.mjs does. The
       # loop re-reads the branch tip on each attempt, so a racing run can't
@@ -128,18 +129,18 @@ jobs:
           BRANCH="${{ github.ref_name }}"
           git config user.name  "kinepolis-watch"
           git config user.email "actions@github.com"
-
+ 
           for attempt in 1 2 3; do
             cp seen.json /tmp/ours.json
             git fetch --quiet origin "$BRANCH"
             git reset --hard --quiet "origin/$BRANCH"
             node merge-state.mjs /tmp/ours.json seen.json
-
+ 
             if git diff --quiet -- seen.json; then
               echo "no state change"
               exit 0
             fi
-
+ 
             git add seen.json
             git commit -q -m "state: update seen sessions [skip ci]"
             if git push --quiet origin "HEAD:$BRANCH"; then
@@ -148,9 +149,9 @@ jobs:
             fi
             echo "push race on attempt $attempt, retrying"
           done
-
+ 
           echo "::warning::could not persist seen.json after 3 attempts — worst case is a duplicate notification next run"
-
+ 
       # Dead-man's switch. Covers what the script itself can't report: feed
       # unreachable, JSON shape changed, runner IP blocked, push rejected.
       - name: Push on failure
@@ -172,7 +173,7 @@ jobs:
             -H "Tags: warning" \
             -d "Poll job errored. See ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             "https://ntfy.sh/$NTFY_TOPIC" || true
-
+ 
   # Runs ONLY on the weekly cron — not on every poll. That `github.event.schedule`
   # comparison is the whole point; gating on `event_name == 'schedule'` instead
   # would fire this every 30 minutes and double the minutes bill.
@@ -184,10 +185,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-
+ 
       - name: Prove the pipeline still finds real 70mm sessions
         run: node kinepolis-watch.mjs --selftest
-
+ 
       # Keepalive. GitHub disables scheduled workflows after 60 days of
       # repository inactivity, and seen.json won't change for months while we
       # wait for December — so this weekly commit is what keeps the schedule
@@ -212,7 +213,7 @@ jobs:
             fi
           done
           echo "::warning::heartbeat push failed — check the 60-day schedule-disable rule"
-
+ 
       - name: Push on selftest failure
         if: failure()
         run: |
