@@ -24,10 +24,15 @@ on:
   repository_dispatch:
     types: [poll]
   schedule:
-    # Every 30 minutes, at :07 and :37. Deliberately off the :00/:30 marks —
-    # those are the most contended minutes on GitHub's scheduler and the most
-    # likely to be delayed or dropped.
-    - cron: '7,37 * * * *'
+    # Hourly, at :07. Deliberately off the :00 mark — that is the single most
+    # contended minute on GitHub's scheduler and the most likely to be delayed
+    # or dropped entirely.
+    #
+    # Hourly means up to ~60 min of latency on an onsale (plus GitHub's own
+    # scheduling lag). Fine for the months of waiting. When Dune 3 gets close —
+    # say from early November — consider tightening to '7,37 * * * *' or even
+    # '7,22,37,52 * * * *'; the minutes budget below has ample room for it.
+    - cron: '7 * * * *'
     # Weekly proof-of-life, Mondays 09:13 UTC. Separate cron so the selftest job
     # can tell itself apart from a routine poll via github.event.schedule.
     - cron: '13 9 * * 1'
