@@ -22,17 +22,26 @@ on:
         type: boolean
         default: false
   repository_dispatch:
-    types: [poll]
   schedule:
-    # Hourly, at :07. Deliberately off the :00 mark — that is the single most
-    # contended minute on GitHub's scheduler and the most likely to be delayed
-    # or dropped entirely.
+    # Hourly at :07 during waking hours only — nothing between midnight and 07:00.
     #
-    # Hourly means up to ~60 min of latency on an onsale (plus GitHub's own
-    # scheduling lag). Fine for the months of waiting. When Dune 3 gets close —
-    # say from early November — consider tightening to '7,37 * * * *' or even
-    # '7,22,37,52 * * * *'; the minutes budget below has ample room for it.
-    - cron: '7 * * * *'
+    # IMPORTANT: cron here is UTC and has no idea about DST, while Brussels moves
+    # between UTC+1 (CET, winter) and UTC+2 (CEST, summer). Hours 6-22 UTC means:
+    #
+    #   December (CET, UTC+1)  → 07:07 .. 23:07 local   ← exactly what you asked
+    #   Summer   (CEST, UTC+2) → 08:07 .. 00:07 local   ← one run just after midnight
+    #
+    # Dune 3 is a December release, so this is tuned for CET. If you want zero
+    # post-midnight runs year-round instead, use '7 6-21 * * *' — that costs you
+    # the 23:00 hour in winter but never fires at night in either season.
+    #
+    # :07 rather than :00 on purpose — :00 is the most contended minute on
+    # GitHub's scheduler and the likeliest to be delayed or dropped.
+    #
+    # Latency note: hourly means up to ~60 min (plus GitHub's own lag) before an
+    # onsale is noticed. Fine for the waiting months. From early November,
+    # consider '7,37 6-22 * * *' for the run-up — the budget below has room.
+    - cron: '7 6-22 * * *'
     # Weekly proof-of-life, Mondays 09:13 UTC. Separate cron so the selftest job
     # can tell itself apart from a routine poll via github.event.schedule.
     - cron: '13 9 * * 1'
