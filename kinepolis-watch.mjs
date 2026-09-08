@@ -30,17 +30,36 @@ const FEED = process.env.FEED_URL || 'https://kinepolisweb-programmation.kinepol
 const COMPLEX = 'KBRU';          // Kinepolis Brussel. The ONLY BE venue with 70mm.
 const STATE_FILE = process.env.STATE_FILE || './seen.json';
 
-// Primary key for Dune 3, read off the live site:
-//   https://kinepolis.be/nl/movies/detail/36318/HO00013472/0/dune-part-three
-//                                        ^corporateId  ^film id
+// Kinepolis does NOT have one entity for Dune 3 — it has several, each with its
+// own film id. URLs decode as /detail/{corporateId}/{filmId}/{eventId}/{slug}:
+//
+//   /detail/36318/HO00013472/0/dune-part-three                  ← main release
+//   /detail/36318/HO00013828/0000000001/avant-premiere-dune-...  ← avant-première
+//
+// Both CONFIRMED against api/Details/BE/NL/{id}/WWW on 8 Sep 2026:
+//
+//   HO00013472  corporateId 36318  "Dune Part Three"
+//   HO00013828  corporateId 36318  "Avant-Première: Dune Part Three"
+//                                  event { name: "Avant-première", shortName: "AP",
+//                                          code: "0000000001", id: "10" }
+//
+// Same corporateId, DIFFERENT film id, and the avant-première is tagged as an
+// event. Expect more of these: a Dolby/ScreenX event entry, a marathon, an FR
+// title. The avant-première matters most because a preview screening is often
+// the FIRST thing on sale and frequently the premium-format one.
+//
+// So matching is deliberately layered, widest net last:
+//   1. known film ids
+//   2. known corporateIds  (catches new event entries sharing the movie)
+//   3. any catalogue title containing "dune", minus Part One / Part Two
 const TARGET = {
-  filmId: 'HO00013472',
-  corporateId: 36318,
-  // Fallback in case Kinepolis re-issues the film under a new HO code — which
-  // does happen when a distributor resubmits a title. Matching on id ALONE is
-  // the single most likely way this watcher silently misses the thing.
+  filmIds: ['HO00013472', 'HO00013828'],
+  corporateIds: [36318],
   titleRe: /dune/i,
-  titlePartRe: /(part\s*)?(three|3|iii|drie)/i,
+  // Don't fire for a Dune 1 / Dune 2 re-release. "Part Three" survives this.
+  titleExcludeRe: /part\s*(one|two|1|2)\b|deel\s*(een|twee|1|2)\b|partie\s*(un|deux|1|2)\b/i,
+  // For the booking link in notifications.
+  bookingUrl: 'https://kinepolis.be/nl/movies/detail/36318/HO00013472/0/dune-part-three',
 };
 
 // ---------------------------------------------------------------------------
@@ -67,13 +86,27 @@ function is70mm(s) {
 
 const atBrussels = (s) => s.mainComplex === COMPLEX || s.complexOperator === COMPLEX;
 
+/** Does this catalogue title look like Dune 3 (in any of its guises)? */
+const titleIsTarget = (t) =>
+  !!t && TARGET.titleRe.test(t) && !TARGET.titleExcludeRe.test(t);
+
 function isTarget(session, filmsById) {
   const f = session.film ?? {};
-  if (f.id === TARGET.filmId) return true;
-  if (f.corporateId === TARGET.corporateId) return true;
-  const title = filmsById[f.id]?.title ?? '';
-  return TARGET.titleRe.test(title) && TARGET.titlePartRe.test(title);
+  if (TARGET.filmIds.includes(f.id)) return true;
+  if (TARGET.corporateIds.includes(f.corporateId)) return true;
+  // Title fallback. Note a session can reference a film id that is absent from
+  // the films array, in which case there is no title to test and only the id /
+  // corporateId checks above can save us — which is exactly why both lists
+  // exist rather than relying on titles alone.
+  return titleIsTarget(filmsById[f.id]?.title);
 }
+
+/** A matching session whose film id we don't know about yet — worth surfacing. */
+const isUnknownEntity = (s) =>
+  !TARGET.filmIds.includes(s.film?.id) && !!s.film?.id;
+
+/** Human label for a session's film, falling back to the raw id. */
+const titleOf = (s, filmsById) => filmsById[s.film?.id]?.title ?? s.film?.id ?? '?';
 
 // ---------------------------------------------------------------------------
 // FETCH + PARSE
@@ -108,7 +141,13 @@ function canary(feed, state = {}) {
   const notes = [];
   const S = feed.sessions;
 
-  if (S.length < 2000) problems.push(`only ${S.length} sessions in feed (expected ~9k) — feed may be truncated`);
+  // The feed is a rolling window and it SHRINKS outside peak season — observed
+  // 10,094 (18 Aug) → 8,640 (21 Aug) → 5,105 (8 Sep). A floor set near the
+  // summer high would start crying wolf in a quiet month, so this is set well
+  // below any plausible legitimate level: a genuinely broken feed returns zero
+  // or fails to parse, and 1,000+ valid sessions is still perfectly usable.
+  // maxSessionsSeen is recorded purely so a real collapse is diagnosable later.
+  if (S.length < 1000) problems.push(`only ${S.length} sessions in feed — feed may be truncated`);
   if (!Array.isArray(feed.films) || feed.films.length < 50) problems.push(`films array is ${feed.films?.length} entries — expected 200+`);
 
   const bru = S.filter(atBrussels);
@@ -158,6 +197,7 @@ function canary(feed, state = {}) {
     problems,
     notes,
     formats,
+    maxSessionsSeen: Math.max(state.maxSessionsSeen ?? 0, S.length),
     stats: { sessions: S.length, films: feed.films?.length, brussels: bru.length, seventyMmBE: anywhere70.length, formats },
   };
 }
@@ -206,7 +246,7 @@ async function sendNtfy(alert) {
           // which is how we get 🎬 in the title without putting a non-latin-1
           // byte in a header.
           'Tags': alert.tags || 'clapper',
-          'Click': `https://kinepolis.be/nl/movies/detail/${TARGET.corporateId}/${TARGET.filmId}/0/dune-part-three`,
+          'Click': TARGET.bookingUrl,
         },
         body: alert.body,
       });
@@ -242,12 +282,22 @@ async function main() {
   // after subscribing the ntfy app. If no notification arrives, the topic name
   // is wrong or the app isn't subscribed, and you want to know that now.
   if (mode === '--testpush') {
+    // Mirrors a real 70mm alert EXACTLY — same urgent priority, same tags, same
+    // click-through URL. A test that sends at default priority wouldn't prove
+    // the notification can bypass Do Not Disturb, which is the property the
+    // whole thing depends on at onsale time.
     const r = await sendNtfy({
       tier: 'test',
-      subject: '🎬 TEST — Dune 3 IMAX 70mm watcher',
-      body: 'If you can read this on your phone, the alert path works.\nThis is a test; no sessions have been found.',
+      priority: 'urgent',
+      tags: 'clapper,fire',
+      subject: 'TEST - 2 new IMAX 70mm sessions for Dune 3 at Kinepolis Brussel',
+      body: 'THIS IS A TEST. No sessions have been found.\n\n'
+          + 'It is formatted exactly like the real alert, at the same urgent priority,\n'
+          + 'so if this cuts through Do Not Disturb then the real one will too.\n\n'
+          + 'Tap this notification — it should open the Kinepolis booking page.',
     });
     console.log(JSON.stringify(r, null, 2));
+    if (!r.ok) console.error('Test push FAILED — the alert path is not working.');
     process.exit(r.ok ? 0 : 1);
   }
 
@@ -261,6 +311,7 @@ async function main() {
   // Grow the known-format vocabulary. Union, never replace — a format that
   // disappears for a season must stay "known" so its return isn't misread as new.
   state.knownFormats = [...new Set([...(state.knownFormats ?? []), ...health.formats])].sort();
+  state.maxSessionsSeen = health.maxSessionsSeen;
 
   if (mode === '--dump' || mode === '--selftest') {
     const all70 = feed.sessions.filter(is70mm);
@@ -279,7 +330,10 @@ async function main() {
     const dune = feed.sessions.filter((s) => isTarget(s, filmsById));
     console.log(`\n--- TARGET (Dune 3) ---`);
     console.log(`  sessions anywhere in BE : ${dune.length}`);
-    console.log(`  present in films array  : ${!!filmsById[TARGET.filmId]}`);
+    for (const id of TARGET.filmIds) console.log(`  ${id} in films array : ${!!filmsById[id]}`);
+    const duneTitles = Object.values(filmsById).filter((f) => titleIsTarget(f.title));
+    console.log(`  catalogue entries matching "dune" : ${duneTitles.length}`);
+    duneTitles.forEach((f) => console.log(`      ${f.id}  corp ${f.corporateId}  ${f.title}${TARGET.filmIds.includes(f.id) ? '' : '   <-- UNKNOWN ID, add to TARGET.filmIds'}`));
     if (mode === '--selftest') {
       // Pass/fail is driven by the canary, NOT by "did we find 70mm sessions".
       // A legitimate gap in 70mm programming (very likely between The Odyssey
@@ -322,7 +376,8 @@ async function main() {
   }
 
   // Tier 1 — early warning: film enters the catalogue before any session exists.
-  const inFilms = !!filmsById[TARGET.filmId] || Object.values(filmsById).some((f) => TARGET.titleRe.test(f.title ?? '') && TARGET.titlePartRe.test(f.title ?? ''));
+  const inFilms = TARGET.filmIds.some((id) => !!filmsById[id])
+    || Object.values(filmsById).some((f) => titleIsTarget(f.title));
   if (inFilms && !state.targetSeenInFilms) {
     alerts.push({ tier: 'catalogue', push: true, priority: 'low', tags: 'eyes', subject: 'Dune 3 just entered the Kinepolis feed', body: 'No sessions yet, but the film is now in the catalogue — showtimes usually follow within days. Watch for presales.' });
     state.targetSeenInFilms = true;
@@ -334,23 +389,34 @@ async function main() {
   // one it matches, so a 70mm screening at Brussels produces exactly one urgent
   // push rather than three notifications about the same show. Nothing is
   // dropped — the last bucket matches everything left over.
+  //
+  // `what` names the actual catalogue title(s) so an avant-première is instantly
+  // distinguishable from the main release in the notification itself — they are
+  // separate entities with separate onsales and you may want the preview first.
   const BUCKETS = [
     { key: '70mm-kbru', priority: 'urgent', tags: 'clapper,fire',
       match: (s) => atBrussels(s) && is70mm(s),
-      title: (n) => `${n} new IMAX 70mm session${n > 1 ? 's' : ''} for Dune 3 at Kinepolis Brussel` },
+      title: (n, what) => `${n} new IMAX 70mm session${n > 1 ? 's' : ''} at Kinepolis Brussel - ${what}` },
 
     { key: '70mm-elsewhere', priority: 'high', tags: 'clapper',
       match: (s) => is70mm(s),
-      title: (n) => `Dune 3 in IMAX 70mm outside Brussels (${n} session${n > 1 ? 's' : ''})` },
+      title: (n, what) => `IMAX 70mm outside Brussels (${n} session${n > 1 ? 's' : ''}) - ${what}` },
 
     { key: 'any-kbru', priority: 'high', tags: 'ticket',
       match: (s) => atBrussels(s),
-      title: (n) => `${n} new Dune 3 session${n > 1 ? 's' : ''} at Kinepolis Brussel` },
+      title: (n, what) => `${n} new session${n > 1 ? 's' : ''} at Kinepolis Brussel - ${what}` },
 
     { key: 'any-be', priority: 'default', tags: 'ticket',
       match: () => true,
-      title: (n) => `Dune 3 tickets live in Belgium (${n} session${n > 1 ? 's' : ''})` },
+      title: (n, what) => `Tickets live in Belgium (${n} session${n > 1 ? 's' : ''}) - ${what}` },
   ];
+
+  // Distinct titles in a bucket, e.g. "Dune Part Three" or
+  // "Avant-Premiere: Dune Part Three + Dune Part Three".
+  const describe = (list) => {
+    const t = [...new Set(list.map((s) => titleOf(s, filmsById)))];
+    return t.length <= 2 ? t.join(' + ') : `${t[0]} +${t.length - 1} more`;
+  };
 
   const targetSessions = feed.sessions.filter((s) => isTarget(s, filmsById));
   const freshAll = targetSessions.filter((s) => !seen.has(String(s.vistaSessionId)));
@@ -370,10 +436,17 @@ async function main() {
       gatesSeen: true,          // a failed push here must be retried, not lost
       priority: b.priority,
       tags: b.tags,
-      subject: b.title(list.length),
+      subject: b.title(list.length, describe(list)),
       body: list.slice(0, 12).map((s) => fmtSession(s, filmsById)).join('\n')
             + (list.length > 12 ? `\n… +${list.length - 12} more` : '')
-            + `\n\nBook: https://kinepolis.be/nl/movies/detail/${TARGET.corporateId}/${TARGET.filmId}/0/dune-part-three`,
+            // Surface film ids we don't have in TARGET.filmIds. These matched by
+            // corporateId or title, so nothing was missed — but seeing the id
+            // means you can add it and stop depending on the fallback.
+            + (list.some(isUnknownEntity)
+                ? '\n\nNew Kinepolis entity: '
+                  + [...new Set(list.filter(isUnknownEntity).map((s) => `${s.film.id} (${titleOf(s, filmsById)})`))].join(', ')
+                : '')
+            + `\n\nBook: ${TARGET.bookingUrl}`,
     });
   }
 

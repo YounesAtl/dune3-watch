@@ -1,0 +1,5 @@
+# Throwaway state written by test/Test-Alert.ps1 — never commit this, it holds
+# fake session ids and would confuse the real watcher's dedupe if it ever merged.
+test/test-seen.json
+test-seen.json
+node_modules/

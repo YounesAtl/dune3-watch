@@ -1,0 +1,230 @@
+# .github/workflows/watch-70mm.yml
+#
+# Dune 3 IMAX 70mm watcher for Kinepolis Brussel. Push notifications only.
+#
+# ONE secret required: NTFY_TOPIC
+#
+# COST: this configuration REQUIRES a PUBLIC repository, where standard
+# GitHub-hosted runner minutes are free and unmetered.
+#
+#   poll      every 5 min, 24/7 → ~8,700 runs/month
+#   selftest  weekly           → ~4 runs/month
+#
+# Public repo: free. Private repo: ~8,700 min against a 2,000-min allowance —
+# it would exhaust the quota in roughly a week and the watcher would stop
+# silently, which is the one failure mode that actually costs you tickets.
+# Fallback crons if this ever goes private: see the schedule block below.
+
+name: Dune 3 IMAX 70mm watch
+
+on:
+  workflow_dispatch:              # manual + your external trigger
+    inputs:
+      test_push:
+        description: 'Send a test push notification (proves the NTFY_TOPIC secret is correct)'
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [poll]
+  schedule:
+    # Every 5 minutes, around the clock. This is GitHub's HARD MINIMUM for
+    # scheduled workflows — a shorter interval is rejected, so this is as fast
+    # as cron can go here.
+    #
+    # It also happens to be the optimum rather than merely the maximum: the
+    # Kinepolis feed is served with Cache-Control: max-age=300, i.e. a 5-minute
+    # TTL. Polling more often would just re-read an identical cached response.
+    # 5 minutes lands exactly when fresh data can first appear.
+    #
+    # No offset minutes here (earlier versions used :07/:22/:37/:52 to dodge the
+    # contended :00 mark). At 12 polls an hour, losing the :00 one costs 5
+    # minutes of latency, so the added complexity stopped being worth it.
+    #
+    # !! REQUIRES A PUBLIC REPO !!  ~8,700 runs/month. On a public repo,
+    # standard-runner minutes are free and unmetered. On a PRIVATE repo this
+    # would consume ~8,700 of a 2,000-minute allowance and the watcher would
+    # stop dead about a week into every month. If this repo is ever made
+    # private again, reduce the cron BEFORE flipping it:
+    #   '7,37 6-22 * * *'  ~1,038 min/month
+    #   '7 6-22 * * *'     ~521 min/month
+    - cron: '*/5 * * * *'
+    # Weekly proof-of-life, Mondays 09:13 UTC. Separate cron so the selftest job
+    # can tell itself apart from a routine poll via github.event.schedule.
+    - cron: '13 9 * * 1'
+
+permissions:
+  contents: write                 # to commit seen.json / heartbeat back
+
+concurrency:
+  group: kinepolis-watch
+  cancel-in-progress: false       # never kill a run mid-push
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Reachability check. It must be a GET with a real User-Agent: the WAF
+      # answers 403 to a HEAD request (curl -I) and to curl's default UA, which
+      # looks alarming but says nothing about whether the actual poll works.
+      # Ask the same way the script does, or don't ask at all.
+      - name: Check API reachability from runner
+        run: |
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 90 \
+            -H 'Accept: application/json' \
+            -A 'kinepolis-70mm-watch/1.0 (personal showtime alert)' \
+            https://kinepolisweb-programmation.kinepolis.com/api/Programmation/BE/NL/WWW)
+          echo "GET returned HTTP $code"
+          [[ "$code" == "200" ]] || echo "::warning::expected 200, got $code — the poll step below is the real test"
+
+      # Fail loudly and immediately if the topic is missing. Without this the
+      # secret's absence stays invisible until the one run that actually has
+      # something to tell you — and then the alert silently goes nowhere.
+      - name: Verify NTFY_TOPIC is configured
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          if [[ -z "$NTFY_TOPIC" ]]; then
+            echo "::error::NTFY_TOPIC secret is empty or missing. Add it under"
+            echo "::error::Settings > Secrets and variables > Actions. No push can be sent without it."
+            exit 1
+          fi
+          echo "NTFY_TOPIC is set (${#NTFY_TOPIC} chars)"
+
+      # Tick "test_push" when running manually to prove the secret in GitHub is
+      # the RIGHT topic, not merely present. The verify step above only checks it
+      # is non-empty — a typo or a trailing space would pass that and then fail
+      # silently in December.
+      - name: Send test push
+        if: inputs.test_push
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: node kinepolis-watch.mjs --testpush
+
+      # The dispatch SHA can be older than the branch tip, which would make the
+      # script read a stale seen.json and re-alert things already reported.
+      # Snap to the current tip before polling.
+      - name: Sync to branch tip
+        run: |
+          git fetch --quiet origin "${{ github.ref_name }}"
+          git reset --hard --quiet "origin/${{ github.ref_name }}"
+          echo "at $(git rev-parse --short HEAD)"
+
+      - name: Poll feed
+        id: poll
+        run: node kinepolis-watch.mjs
+        env:
+          STATE_FILE: ./seen.json
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+
+      # NEVER rebase generated state. seen.json is a growing set, so the correct
+      # conflict resolution is always "union", which merge-state.mjs does. The
+      # loop re-reads the branch tip on each attempt, so a racing run can't
+      # clobber anything — and a persistent failure warns instead of failing the
+      # job, because a lost state write only costs a duplicate notification,
+      # whereas a red X every 30 minutes is noise that gets ignored.
+      - name: Persist seen list
+        if: always()
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          git config user.name  "kinepolis-watch"
+          git config user.email "actions@github.com"
+
+          for attempt in 1 2 3; do
+            cp seen.json /tmp/ours.json
+            git fetch --quiet origin "$BRANCH"
+            git reset --hard --quiet "origin/$BRANCH"
+            node merge-state.mjs /tmp/ours.json seen.json
+
+            if git diff --quiet -- seen.json; then
+              echo "no state change"
+              exit 0
+            fi
+
+            git add seen.json
+            git commit -q -m "state: update seen sessions [skip ci]"
+            if git push --quiet origin "HEAD:$BRANCH"; then
+              echo "state pushed on attempt $attempt"
+              exit 0
+            fi
+            echo "push race on attempt $attempt, retrying"
+          done
+
+          echo "::warning::could not persist seen.json after 3 attempts — worst case is a duplicate notification next run"
+
+      # Dead-man's switch. Covers what the script itself can't report: feed
+      # unreachable, JSON shape changed, runner IP blocked, push rejected.
+      - name: Push on failure
+        if: failure()
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          # Guard on the topic: with an empty one the URL collapses to
+          # https://ntfy.sh/ , which is ntfy's JSON API and answers
+          # 400 "request body must be valid JSON" — a confusing error that hides
+          # the real problem (the secret is missing).
+          if [[ -z "$NTFY_TOPIC" ]]; then
+            echo "::error::cannot send failure push — NTFY_TOPIC is not set"
+            exit 0
+          fi
+          curl -sS \
+            -H "Title: Kinepolis 70mm watcher FAILED" \
+            -H "Priority: high" \
+            -H "Tags: warning" \
+            -d "Poll job errored. See ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "https://ntfy.sh/$NTFY_TOPIC" || true
+
+  # Runs ONLY on the weekly cron — not on every poll. That `github.event.schedule`
+  # comparison is the whole point; gating on `event_name == 'schedule'` instead
+  # would fire this every 30 minutes and double the minutes bill.
+  selftest:
+    if: github.event.schedule == '13 9 * * 1'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Prove the pipeline still finds real 70mm sessions
+        run: node kinepolis-watch.mjs --selftest
+
+      # Keepalive. GitHub disables scheduled workflows after 60 days of
+      # repository inactivity, and seen.json won't change for months while we
+      # wait for December — so this weekly commit is what keeps the schedule
+      # alive. Without it the watcher would quietly switch itself off in October.
+      - name: Heartbeat
+        if: always()
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          git config user.name  "kinepolis-watch"
+          git config user.email "actions@github.com"
+          # Same rule as the state push: snap to the tip, then write. Never
+          # rebase — a conflict here would fail the job for no useful reason.
+          for attempt in 1 2 3; do
+            git fetch --quiet origin "$BRANCH"
+            git reset --hard --quiet "origin/$BRANCH"
+            date -u +"last selftest: %Y-%m-%dT%H:%M:%SZ" > heartbeat.txt
+            git add heartbeat.txt
+            git commit -q -m "chore: weekly heartbeat [skip ci]" || exit 0
+            if git push --quiet origin "HEAD:$BRANCH"; then
+              echo "heartbeat pushed on attempt $attempt"
+              exit 0
+            fi
+          done
+          echo "::warning::heartbeat push failed — check the 60-day schedule-disable rule"
+
+      - name: Push on selftest failure
+        if: failure()
+        run: |
+          curl -sS \
+            -H "Title: Kinepolis watcher selftest FAILED" \
+            -H "Priority: high" \
+            -H "Tags: warning" \
+            -d "The pipeline can no longer find 70mm sessions that should exist. See ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "https://ntfy.sh/${{ secrets.NTFY_TOPIC }}" || true
