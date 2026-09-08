@@ -27,9 +27,8 @@ on:
   repository_dispatch:
     types: [poll]
   schedule:
-    # Every 5 minutes, around the clock. 
-    # Minutes are :02, :07, :12, :17, ... to avoid the heavily-contended 5-minute mark (:00, :05, :10, etc.).
-    - cron: '2-59/5 * * * *'
+    # Every 5 minutes on September 9th (UTC), offset by 2 minutes to avoid peak queue delays
+    - cron: '2-59/5 * 9 9 *'
     # Weekly proof-of-life, Mondays 09:13 UTC.
     - cron: '13 9 * * 1'
  
