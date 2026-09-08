@@ -27,23 +27,10 @@ on:
   repository_dispatch:
     types: [poll]
   schedule:
-    # Every 15 minutes, around the clock. No DST handling needed: the schedule is
-    # uniform across all hours, so it means the same thing in CET and CEST.
-    #
-    # Minutes are :07 :22 :37 :52 rather than :00 :15 :30 :45 on purpose — the
-    # quarter-hour marks are the most contended on GitHub's scheduler and the
-    # likeliest to be delayed or dropped.
-    #
-    # Worst-case latency on an onsale is now ~15 min plus GitHub's own lag.
-    #
-    # !! REQUIRES A PUBLIC REPO !!  On a public repo, standard-runner minutes are
-    # free and unmetered. On a PRIVATE repo this cron costs ~2900 min/month
-    # against a 2000-minute allowance — it would overrun and the watcher would
-    # stop. If you ever flip this repo back to private, drop to
-    # '7,37 6-22 * * *' (~1038 min) or '7 6-22 * * *' (~521 min) first.
-    - cron: '7,22,37,52 * * * *'
-    # Weekly proof-of-life, Mondays 09:13 UTC. Separate cron so the selftest job
-    # can tell itself apart from a routine poll via github.event.schedule.
+    # Every 5 minutes, around the clock. 
+    # Minutes are :02, :07, :12, :17, ... to avoid the heavily-contended 5-minute mark (:00, :05, :10, etc.).
+    - cron: '2-59/5 * * * *'
+    # Weekly proof-of-life, Mondays 09:13 UTC.
     - cron: '13 9 * * 1'
  
 permissions:
