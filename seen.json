@@ -1,6 +1,19 @@
 {
-  "seenSessionIds": [],
-  "lastRunISO": "2026-09-09T06:19:09.688Z",
+  "seenSessionIds": [
+    "395856",
+    "395857",
+    "241608",
+    "162548",
+    "114378",
+    "217816",
+    "249127",
+    "131089",
+    "158653",
+    "353993",
+    "134541",
+    "66616"
+  ],
+  "lastRunISO": "2026-09-09T11:34:56.108Z",
   "lastCanaryOk": true,
   "knownFormats": [
     "2D",
@@ -14,6 +27,6 @@
     "ScreenX 2D",
     "ScreenX 3D"
   ],
-  "targetSeenInFilms": false,
+  "targetSeenInFilms": true,
   "maxSessionsSeen": 5117
 }
